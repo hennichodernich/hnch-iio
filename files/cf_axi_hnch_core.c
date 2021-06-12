@@ -25,53 +25,68 @@
 #include <linux/clk.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/version.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/buffer.h>
 
 #include "cf_axi_hnch.h"
-
+#include "hnchboard_hw_config.h"
 #include "si5351_defs.h"
 
 
-#define AIM_CHAN(_chan, _si, _bits, _sign)							\
-	{ .type = IIO_VOLTAGE,											\
-	  .indexed = 1,													\
-	  .channel = _chan,												\
-	  .info_mask_separate = 0,                       				\
-	  .info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SAMP_FREQ) |  	\
-	  	  	  	  	  	  	  	  BIT(IIO_CHAN_INFO_HARDWAREGAIN) | \
-								  BIT(IIO_CHAN_INFO_FREQUENCY),	    \
-	  .ext_info = NULL,												\
-	  .scan_index = _si,											\
-	  .scan_type = {												\
-		.sign = _sign,												\
-		.realbits = _bits,											\
-		.storagebits = 16,											\
-		.shift = 0,													\
-	  },															\
-	}
 
+#ifdef HNCHBOARD_HAVE_MIXER
+#define CHAN_MASK BIT(IIO_CHAN_INFO_SAMP_FREQ) | BIT(IIO_CHAN_INFO_HARDWAREGAIN) | BIT(IIO_CHAN_INFO_FREQUENCY)
+#else
+#define CHAN_MASK BIT(IIO_CHAN_INFO_SAMP_FREQ) | BIT(IIO_CHAN_INFO_HARDWAREGAIN)
+#endif
+
+#define AIM_CHAN(_chan, _si, _bits, _sign)	\
+	{ .type = IIO_VOLTAGE,					\
+	  .indexed = 1,							\
+	  .channel = _chan,						\
+	  .info_mask_separate = 0,              \
+	  .info_mask_shared_by_type = CHAN_MASK,\
+	  .ext_info = NULL,						\
+	  .scan_index = _si,					\
+	  .scan_type = {						\
+		.sign = _sign,						\
+		.realbits = _bits,					\
+		.storagebits = 16,					\
+		.shift = 0,							\
+	  },									\
+	}
 
 struct hnchadc_core_info {
 	unsigned int version;
 };
 
 static const unsigned long dummy_available_scan_masks[] = {
+#ifdef HNCHBOARD_HAVE_MIXER
 	0x0F, 0x03, 0x0C, 0x05, 0
+#else
+	0x03, 0
+#endif
 };
 
 static const struct hnchadc_chip_info dummychip_info = {
 		.name = "dummychip",
 		.max_rate = 40000000UL,
 		.max_testmode = 0,
+#ifdef HNCHBOARD_HAVE_MIXER
 		.num_channels = 4,
+#else
+		.num_channels = 2,
+#endif
 		.scan_masks = dummy_available_scan_masks,
 		.channel[0] = AIM_CHAN(0, 0, 12, 'S'),
 		.channel[1] = AIM_CHAN(1, 1, 12, 'S'),
+#ifdef HNCHBOARD_HAVE_MIXER
 		.channel[2] = AIM_CHAN(2, 2, 12, 'S'),
 		.channel[3] = AIM_CHAN(3, 3, 12, 'S'),
+#endif
 	};
 
 static struct attribute *dummy_phy_attributes[] = {
@@ -89,7 +104,6 @@ static int hnchadc_chan_to_regoffset(struct iio_chan_spec const *chan)
 
 	return chan->channel;
 }
-
 
 static unsigned int hnchadc_num_phys_channels(struct hnchadc_state *st)
 {
@@ -118,7 +132,7 @@ static ssize_t hnchadc_sampling_frequency_available(struct device *dev,
 	int i, ret;
 
 
-	ret = snprintf(buf, PAGE_SIZE, "[125000 1 40000000]\n");
+	ret = snprintf(buf, PAGE_SIZE, "[125000 1 %ld]\n",HNCHBOARD_MAX_RATE);
 
 //	mutex_lock(&indio_dev->mlock);
 //	mutex_unlock(&indio_dev->mlock);
@@ -183,11 +197,13 @@ static int hnchadc_read_raw(struct iio_dev *indio_dev,
 		(vga_info->read_raw)(vga_indio_dev, &command, val, val2, IIO_CHAN_INFO_HARDWAREGAIN);
 		mutex_unlock(&indio_dev->mlock);
 		return IIO_VAL_INT_PLUS_MICRO_DB;
+#ifdef HNCHBOARD_HAVE_MIXER
 	case IIO_CHAN_INFO_FREQUENCY:
 		hnchadc_get_physical_sampling_frequency(st, &freq);
 		freq *= st->band_select;
 		*val = freq / st->decimation_factor;
 		return IIO_VAL_INT;
+#endif
 	default:
 		return -EINVAL;
 	}
@@ -254,11 +270,12 @@ static int hnchadc_write_raw(struct iio_dev *indio_dev,
 			return 0;
 		}
 
-		if ((val<125000) || (val>40000000)){
+		if ((val<125000) || (val>HNCHBOARD_MAX_RATE)){
 			dev_err(&indio_dev->dev, "Sampling frequency out of range\n");
 			return -EINVAL;
 		}
 
+#ifdef HNCHBOARD_HAVE_DECIMATOR
 		if (val<=5000000){
 			st->decimation_factor = 8;
 			st->decimation_enable = 1;
@@ -267,24 +284,28 @@ static int hnchadc_write_raw(struct iio_dev *indio_dev,
 			st->decimation_factor = 1;
 			st->decimation_enable = 0;
 		}
+#else
+		st->decimation_factor = 1;
+		st->decimation_enable = 0;
+#endif
 
 		synth_freq = st->decimation_factor * val;
 		st->adc_clk = synth_freq;
 
-		if (synth_freq==4000000){
+		if (synth_freq<=4000000){
 			st->led_color = 1;
-		}else if (synth_freq==8000000){
+		}else if (synth_freq<=8000000){
 			st->led_color = 2;
-		}else if (synth_freq==10000000){
+		}else if (synth_freq<=10000000){
 			st->led_color = 4;
-		}else if (synth_freq==20000000){
+		}else if (synth_freq<=20000000){
 			st->led_color = 6;
-		}else if (synth_freq==24000000){
+		}else if (synth_freq<=24000000){
 			st->led_color = 3;
-		}else if (synth_freq==40000000){
+		}else if (synth_freq<=40000000){
 			st->led_color = 5;
 		}else{
-			st->led_color = 0;
+			st->led_color = 7;
 		}
 		hnchadc_write(st, 0, ( (st->led_color         & 0x07) << LED_OFFSET) \
 							| ((st->decimation_enable & 0x01) << DECIMATE_OFFSET) \
@@ -324,6 +345,7 @@ static int hnchadc_write_raw(struct iio_dev *indio_dev,
 
 		mutex_unlock(&indio_dev->mlock);
 		return 0;
+#ifdef HNCHBOARD_HAVE_MIXER
 	case IIO_CHAN_INFO_FREQUENCY:
 		hnchadc_get_physical_sampling_frequency(st, &tmp);
 		if (tmp==0)
@@ -339,44 +361,11 @@ static int hnchadc_write_raw(struct iio_dev *indio_dev,
 							| ((st->band_select       & 0x07) << BAND_SELECT_OFFSET) \
 							| ((st->stream_select     & 0x03) << STREAM_SELECT_OFFSET) );
 		return 0;
+#endif
 	default:
 		return -EINVAL;
 	}
 }
-#if 0
-static int hnchadc_read_event_value(struct iio_dev *indio_dev,
-	const struct iio_chan_spec *chan, enum iio_event_type type,
-	enum iio_event_direction dir, enum iio_event_info info, int *val,
-	int *val2)
-{
-	return -ENOSYS;
-}
-
-static int hnchadc_write_event_value(struct iio_dev *indio_dev,
-	const struct iio_chan_spec *chan, enum iio_event_type type,
-	enum iio_event_direction dir, enum iio_event_info info, int val,
-	int val2)
-{
-	return -ENOSYS;
-}
-
-static int hnchadc_read_event_config(struct iio_dev *indio_dev,
-				    const struct iio_chan_spec *chan,
-				    enum iio_event_type type,
-				    enum iio_event_direction dir)
-{
-	return -ENOSYS;
-}
-
-static int hnchadc_write_event_config(struct iio_dev *indio_dev,
-				     const struct iio_chan_spec *chan,
-				     enum iio_event_type type,
-				     enum iio_event_direction dir,
-				     int state)
-{
-	return -ENOSYS;
-}
-#endif
 
 static int hnchadc_update_scan_mode(struct iio_dev *indio_dev,
 	const unsigned long *scan_mask)
@@ -385,6 +374,7 @@ static int hnchadc_update_scan_mode(struct iio_dev *indio_dev,
 
 	printk(KERN_INFO "cf_axi_hnch: hnchadc_update_scan_mode called with scan mask %x\n",*scan_mask);
 
+#ifdef HNCHBOARD_HAVE_MIXER
 	if (*scan_mask==0x03)
 	{
 		st->stream_select=0;
@@ -409,7 +399,18 @@ static int hnchadc_update_scan_mode(struct iio_dev *indio_dev,
 								| ((st->decimation_enable & 0x01) << DECIMATE_OFFSET) \
 								| ((st->band_select       & 0x07) << BAND_SELECT_OFFSET) \
 								| ((st->stream_select     & 0x03) << STREAM_SELECT_OFFSET) );
+
 	return 0;
+#else
+	if (*scan_mask==0x03)
+	{
+		return 0;
+	}
+	else
+	{
+		return -1;
+	}
+#endif
 }
 
 
@@ -432,17 +433,19 @@ static int hnchadc_channel_setup(struct iio_dev *indio_dev,
 }
 
 static const struct iio_info hnchadc_info = {
-	.driver_module = THIS_MODULE,
 	.read_raw = &hnchadc_read_raw,
 	.write_raw = &hnchadc_write_raw,
 	.update_scan_mode = &hnchadc_update_scan_mode,
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5,0,0)
+	.driver_module = THIS_MODULE,
+#endif	
 };
 
 static const struct hnchadc_core_info dummycore_info = {
 	.version = 0,
 };
 static const struct of_device_id hnchadc_of_match[] = {
-	{ .compatible = "xlnx,hnch-ctrl-1.0", .data = &dummycore_info },
+	{ .compatible = "hnch,hnch-rx-ctrl-1.0", .data = &dummycore_info },
 	{ /* end of list */ },
 };
 MODULE_DEVICE_TABLE(of, hnchadc_of_match);
@@ -634,6 +637,8 @@ err_unconfigure_ring:
 	hnchadc_unconfigure_ring_stream(indio_dev);
 
 err_put_converter:
+	put_device(spidev.dev_spi);
+	module_put(spidev.dev_spi->driver->owner);
 	put_device(i2cdev.dev_i2c);
 	module_put(i2cdev.dev_i2c->driver->owner);
 
@@ -655,6 +660,8 @@ static int hnchadc_remove(struct platform_device *pdev)
 
 	iio_device_unregister(indio_dev);
 
+	put_device(st->dev_spi);
+	module_put(st->dev_spi->driver->owner);
 	put_device(st->dev_i2c);
 	module_put(st->dev_i2c->driver->owner);
 
